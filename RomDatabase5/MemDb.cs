@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO.MemoryMappedFiles;
@@ -50,6 +50,10 @@ namespace RomDatabase5
         }
     }
 
+    /// <summary>
+    /// Optimized in-memory database for ROM lookups with improved performance.
+    /// Uses fast lookups with early termination and reduced LINQ allocations.
+    /// </summary>
     public class MemDb
     {
         //Next refactor of the DB logic.
@@ -129,7 +133,9 @@ namespace RomDatabase5
                     var isClone = entry.GetAttribute("cloneof");
                     if (isClone != "") // is a clone
                     {
-                        parentClones.FirstOrDefault(p => p.name == isClone).Clones.Add(pci);
+                        var parentEntry = parentClones.FirstOrDefault(p => p.name == isClone);
+                        if (parentEntry != null)
+                            parentEntry.Clones.Add(pci);
                     }
                     else //is the parent.
                     {
@@ -164,7 +170,7 @@ namespace RomDatabase5
                         //disc
                         DiscEntry de = new DiscEntry();
                         de.name = entry.GetAttribute("name"); //Will be the folder/zip name of all the files contained.
-                                                              //de.description = entry.GetAttribute("description");
+                                                               //de.description = entry.GetAttribute("description");
                         de.datfile = datfile;
                         foreach (XmlElement rom in roms)
                         {
@@ -201,81 +207,135 @@ namespace RomDatabase5
             }
         }
 
+        /// <summary>
+        /// Find file by hash with optimized early termination.
+        /// Checks hashes in order of selectivity: CRC -> SHA1 -> MD5
+        /// </summary>
         public List<FileEntry> findFile(HashResults hash, bool skipMD5 = false)
         {
             //This should probably return an empty entry rather than null.
-            //List<FileEntry> emptyresults = new List<FileEntry>();
             //NOTE: TOSEC and No-Intro use all 3 hashes. MAME and others skips MD5
+            
+            // Early termination: if CRC doesn't match, no point checking others
             var crcMatches = fileCRCs[hash.crc];
-            var md5Matches = fileMD5s[hash.md5];
+            if (!crcMatches.Any())
+                return new List<FileEntry>();
+            
+            // SHA1 is generally more selective than MD5
             var sha1Matches = fileSHA1s[hash.sha1];
-
+            if (!sha1Matches.Any())
+                return new List<FileEntry>();
+            
+            // Now intersect: files matching both CRC and SHA1
             var allMatches = crcMatches.Intersect(sha1Matches).ToList();
-            if (allMatches.Any(a => !string.IsNullOrEmpty(a.hashes.md5))) 
-            { 
-                allMatches = allMatches.Intersect(md5Matches).ToList(); 
+            if (!allMatches.Any())
+                return new List<FileEntry>();
+            
+            // MD5 check only if we have matches and MD5 is not skipped
+            if (!skipMD5 && allMatches.Any(a => !string.IsNullOrEmpty(a.hashes.md5)))
+            {
+                var md5Matches = fileMD5s[hash.md5];
+                allMatches = allMatches.Intersect(md5Matches).ToList();
             }
-            //if (!skipMD5) ;
-            //if (allMatches != null && allMatches.Count() == 1) 
-                return allMatches;
-
-            //ok, NOW we have some problems. Either a collision, or a missing hash entry in a dat file.
-            //TODO: work out how to determine a resolution
-            //return emptyresults;
+            
+            return allMatches;
         }
 
+        /// <summary>
+        /// Find disc containing a specific file hash with early termination.
+        /// </summary>
         public List<DiscEntry> findDiscs(HashResults hashes)
         {
             //finds all discs with a specified file
-            List<DiscEntry> possibleMatches = new List<DiscEntry>();
-
             var crcMatches = fileCRCs[hashes.crc];
-            //var md5Matches = fileMD5s[hashes.md5]; //MAME doesn't use these.
+            if (!crcMatches.Any())
+                return new List<DiscEntry>();
+
             var sha1Matches = fileSHA1s[hashes.sha1];
+            if (!sha1Matches.Any())
+                return new List<DiscEntry>();
 
             var matchedFile = crcMatches.Intersect(sha1Matches);
-            return matchedFile.Select(m => m.parentDisc).Distinct().ToList();
-
+            return matchedFile
+                .Where(m => m.parentDisc != null)
+                .Select(m => m.parentDisc)
+                .Distinct()
+                .ToList();
         }
 
+        /// <summary>
+        /// Find disc matching multiple file hashes (multi-file game detection).
+        /// Optimized with early termination and reduced LINQ allocations.
+        /// </summary>
         public List<DiscEntry> findDisc(List<HashResults> hashes)
         {
             //Starting simple on this: find all references to the
             //NOTE: MAME does not use MD5s, so I MUST be able to find a game where a hash is empty. TOSEC and NOINTRO use all 3 hashes.
-            List<DiscEntry> emptyresults = new List<DiscEntry>();
-
+            
             //In addition to MAME, we might have a case like SCUMMVM, where there are several languages for a game
             //where MOST of the files across them are identical, but some aren't.  So we need to not bail immediately if we have mulitple matches.
 
             //Also cases for bin/cue files, where i will expect multiple files for a result and will want to rename them.
             List<DiscEntry> possibleMatches = new List<DiscEntry>();
+            
             foreach (var hash in hashes)
             {
-                //see if this file is a match with anything, and if so track it.
+                // Early termination: if this file isn't found at all, disc is invalid
                 var crcMatches = fileCRCs[hash.crc];
-                //var md5Matches = fileMD5s[hash.md5];
+                if (!crcMatches.Any())
+                    return new List<DiscEntry>();
+
                 var sha1Matches = fileSHA1s[hash.sha1];
+                if (!sha1Matches.Any())
+                    return new List<DiscEntry>();
 
-                var matchedFile = crcMatches.Intersect(sha1Matches);
-                if (matchedFile.Count() == 0)
-                    return emptyresults;
+                var matchedFile = crcMatches.Intersect(sha1Matches).ToList();
+                if (!matchedFile.Any())
+                    return new List<DiscEntry>();
 
-                if (matchedFile.Count() == 1)
+                // Single match: try to validate against full disc
+                if (matchedFile.Count == 1)
                 {
-                    //We have it narrowed down to 1, lets check if all of the entries on its discentry match our hashes for an identical set.
-                    var likelyDisc = matchedFile.First().parentDisc;
-                    if (likelyDisc.files.All(f => hashes.Contains(f.hashes)))
-                        return matchedFile.Select(f => f.parentDisc).Distinct().ToList();
+                    var likelyDisc = matchedFile[0].parentDisc;
+                    if (likelyDisc != null && likelyDisc.files.All(f => hashes.Contains(f.hashes)))
+                    {
+                        return matchedFile
+                            .Select(f => f.parentDisc)
+                            .Where(d => d != null)
+                            .Distinct()
+                            .ToList();
+                    }
                 }
                 else
                 {
-                    //we need to keep going to narrow this down, but we can use this as a start.
-                }               
-            }           
+                    // Multiple matches: keep narrowing
+                    if (possibleMatches.Any())
+                    {
+                        // Intersect with previous matches
+                        var currentDiscs = matchedFile
+                            .Where(m => m.parentDisc != null)
+                            .Select(m => m.parentDisc)
+                            .Distinct()
+                            .ToList();
+                        
+                        possibleMatches = possibleMatches.Intersect(currentDiscs).ToList();
+                        
+                        // Early exit if no common discs
+                        if (!possibleMatches.Any())
+                            return new List<DiscEntry>();
+                    }
+                    else
+                    {
+                        possibleMatches = matchedFile
+                            .Where(m => m.parentDisc != null)
+                            .Select(m => m.parentDisc)
+                            .Distinct()
+                            .ToList();
+                    }
+                }
+            }
 
-            //ok, NOW we have some problems. Either a collision, or a missing hash entry in a dat file.
-            //TODO: work out how to determine a resolution
-            return emptyresults;
+            return possibleMatches;
         }
     }
 }

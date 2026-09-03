@@ -1,4 +1,4 @@
-﻿using RomDatabase5;
+using RomDatabase5;
 using System;
 using System.Collections.Generic;
 using System.Data;
@@ -25,6 +25,12 @@ namespace RomSorter5WinForms {
     {
         Sorter sorter = null;
         MemDb db = new MemDb();
+        
+        // Cache for directory enumeration to avoid redundant file system calls
+        private Dictionary<string, List<string>> _fileListCache = new Dictionary<string, List<string>>();
+        private DateTime _cacheTime = DateTime.MinValue;
+        private const int CACHE_VALIDITY_MS = 5000; // Cache valid for 5 seconds
+        
         public Form2()
         {
             sorter = new Sorter();
@@ -114,7 +120,44 @@ namespace RomSorter5WinForms {
                 txtRomPath.Text = System.IO.Path.GetDirectoryName(ofd1.FileName);
                 Properties.Settings.Default.romPath = txtRomPath.Text;
                 Properties.Settings.Default.Save();
+                ClearFileListCache(); // Clear cache when path changes
             }
+        }
+
+        /// <summary>
+        /// Clear the file list cache (useful when directory contents change).
+        /// </summary>
+        private void ClearFileListCache()
+        {
+            _fileListCache.Clear();
+            _cacheTime = DateTime.MinValue;
+        }
+
+        /// <summary>
+        /// Get cached file list or enumerate from disk. Reduces redundant file system calls.
+        /// </summary>
+        private List<string> GetCachedFileList(string path, bool includeSubdirectories = false)
+        {
+            // Check cache validity
+            if ((DateTime.Now - _cacheTime).TotalMilliseconds < CACHE_VALIDITY_MS && 
+                _fileListCache.ContainsKey(path))
+            {
+                return _fileListCache[path];
+            }
+
+            List<string> files = new List<string>();
+            if (includeSubdirectories)
+            {
+                files = Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories).ToList();
+            }
+            else
+            {
+                files = Directory.EnumerateFiles(path).ToList();
+            }
+
+            _fileListCache[path] = files;
+            _cacheTime = DateTime.Now;
+            return files;
         }
 
         //For functions moved to the shared library.
@@ -130,8 +173,8 @@ namespace RomSorter5WinForms {
             {
                 try
                 {
-                    var files = System.IO.Directory.EnumerateFiles(runpath);
-                    progressBar1.Maximum = files.Count();
+                    var files = GetCachedFileList(runpath, false);
+                    progressBar1.Maximum = files.Count;
                     progressBar1.Value = 0;
 
                     Progress<string> p = new Progress<string>(s => { lblStatus.Text = s; if (progressBar1.Value < progressBar1.Maximum) progressBar1.Value++; });
@@ -167,15 +210,8 @@ namespace RomSorter5WinForms {
             }
 
             LockButtons();
-            //if (recurse)
-            //{ 
-            //var folders = System.IO.Directory.EnumerateFiles(txtRomPath.Text, "*", SearchOption.AllDirectories);
-            //foreach(var f in folders)
-            //
-            //}
-            //else
-            var files = System.IO.Directory.EnumerateFiles(txtRomPath.Text);
-            progressBar1.Maximum = files.Count();
+            var files = GetCachedFileList(txtRomPath.Text, false);
+            progressBar1.Maximum = files.Count;
             progressBar1.Value = 0;
 
             Progress<string> p = new Progress<string>(s => { lblStatus.Text = s; if (progressBar1.Value < progressBar1.Maximum) progressBar1.Value++; });
@@ -212,18 +248,15 @@ namespace RomSorter5WinForms {
 
             //Slightly different than BaseBehavior.
             LockButtons();
-            var files = System.IO.Directory.EnumerateDirectories(txtRomPath.Text);
-            //if (chkZipInsteadOfFolders.Checked) //TODO future state
-            //files = System.IO.Directory.EnumerateFiles(txtRomPath.Text);
-            progressBar1.Maximum = files.Count() + 1;
+            var folders = Directory.EnumerateDirectories(txtRomPath.Text).ToList();
+            progressBar1.Maximum = folders.Count + 1;
             progressBar1.Value = 0;
 
             Progress<string> p = new Progress<string>(s => { lblStatus.Text = s; if (progressBar1.Value < progressBar1.Maximum) progressBar1.Value++; });
-            //await Task.Factory.StartNew(() => IdentifyMultiFileGames(p));
-            foreach (var dir in Directory.EnumerateDirectories(txtRomPath.Text))
+            foreach (var dir in folders)
             {
                 progressBar1.Value = 0;
-                await Task.Factory.StartNew(() => CoreFunctions.IdentifyLogic(p, dir, false, db)); //force to not move unidentified files for now.
+                await Task.Factory.StartNew(() => CoreFunctions.IdentifyLogic(p, dir, false, db));
             }
             progressBar1.Value = progressBar1.Maximum;
             lblStatus.Text = "Complete";
@@ -342,35 +375,32 @@ namespace RomSorter5WinForms {
             progress.Report("Completed");
         }
 
-        private int CountConvertingFilesRecursive(string path)
+        /// <summary>
+        /// Count files recursively with caching to avoid redundant enumeration.
+        /// </summary>
+        private int CountFilesRecursive(string path, string[] extensions)
         {
             int fileCount = 0;
-            foreach (var folder in (Directory.EnumerateDirectories(path)))
+            try
             {
-                fileCount += CountConvertingFilesRecursive(folder);
+                var files = GetCachedFileList(path, false);
+                fileCount = files.Count(f => extensions.Any(ext => f.EndsWith(ext, StringComparison.OrdinalIgnoreCase)));
+
+                foreach (var folder in Directory.EnumerateDirectories(path))
+                {
+                    fileCount += CountFilesRecursive(folder, extensions);
+                }
             }
-
-            return fileCount + Directory.EnumerateFiles(path).Where(f => f.EndsWith(".cue") || f.EndsWith(".iso")).Count();
-        }
-
-        private int CountCHDFilesRecursive(string path)
-        {
-            int fileCount = 0;
-            foreach (var folder in (Directory.EnumerateDirectories(path)))
-            {
-                fileCount += CountCHDFilesRecursive(folder);
-            }
-
-            return fileCount + Directory.EnumerateFiles(path).Where(f => f.EndsWith(".chd")).Count();
+            catch { }
+            return fileCount;
         }
 
         private async void btnCreateChds_Click(object sender, EventArgs e)
         {
             LockButtons();
-            int fileCount = CountConvertingFilesRecursive(txtRomPath.Text);
+            int fileCount = CountFilesRecursive(txtRomPath.Text, new[] { ".cue", ".iso" });
 
-
-            progressBar1.Maximum = fileCount + 1; //files.Count() + 1;
+            progressBar1.Maximum = fileCount + 1;
             progressBar1.Value = 0;
 
             Progress<string> p = new Progress<string>(s => { lblStatus.Text = s; if (progressBar1.Value < progressBar1.Maximum) progressBar1.Value++; });
@@ -383,8 +413,7 @@ namespace RomSorter5WinForms {
         private async void btnExtractChds_Click(object sender, EventArgs e)
         {
             LockButtons();
-            //var files = System.IO.Directory.EnumerateFiles(txtRomPath.Text).Where(f => f.EndsWith(".chd")); //Differs from BaseBehavior.
-            int fileCount = CountCHDFilesRecursive(txtRomPath.Text);
+            int fileCount = CountFilesRecursive(txtRomPath.Text, new[] { ".chd" });
             progressBar1.Maximum = fileCount + 1;
             progressBar1.Value = 0;
 
@@ -444,8 +473,8 @@ namespace RomSorter5WinForms {
             formRP.entries = db.parentClones.SelectMany(p => p.Clones.Select(pp => pp.region)).Distinct().ToList();
             formRP.ShowDialog();
 
-            var files = System.IO.Directory.EnumerateFiles(txtRomPath.Text);
-            progressBar1.Maximum = files.Count();
+            var files = GetCachedFileList(txtRomPath.Text, false);
+            progressBar1.Maximum = files.Count;
             progressBar1.Value = 0;
 
             Progress<string> p = new Progress<string>(s => { lblStatus.Text = s; if (progressBar1.Value < progressBar1.Maximum) progressBar1.Value++; });
@@ -456,9 +485,9 @@ namespace RomSorter5WinForms {
         private async void btnEverdrive_Click(object sender, EventArgs e)
         {
             //Progress bar is different here, goes by letter rather than individual file.
-            var files = Directory.EnumerateFiles(txtRomPath.Text).ToList();
-            var letters = files.Select(f => System.IO.Path.GetFileName(f).ToUpper().Substring(0, 1)).Distinct().ToList(); //pick first letter.
-            progressBar1.Maximum = letters.Count();
+            var files = GetCachedFileList(txtRomPath.Text, false);
+            var letters = files.Select(f => System.IO.Path.GetFileName(f).ToUpper().Substring(0, 1)).Distinct().ToList();
+            progressBar1.Maximum = letters.Count;
 
             LockButtons();
             Progress<string> p = new Progress<string>(s => { lblStatus.Text = s; if (progressBar1.Value < progressBar1.Maximum) progressBar1.Value++; });
@@ -468,7 +497,7 @@ namespace RomSorter5WinForms {
 
         private async void btnCreateM3uPlaylists_Click(object sender, EventArgs e)
         {
-            var files = Directory.EnumerateFiles(txtRomPath.Text)
+            var files = GetCachedFileList(txtRomPath.Text, false)
                 .Where(x => x.Contains("disc 1", StringComparison.CurrentCultureIgnoreCase)
                 && (x.Contains(".chd") || x.Contains(".iso") || x.Contains(".cue")))
                 .ToList();
@@ -509,8 +538,6 @@ namespace RomSorter5WinForms {
         {
             //BaseBehavior(CoreFunctions.DeleteIfNoUPS, txtRomPath.Text);
             //BaseBehavior(CoreFunctions.DeleteLowercase, txtRomPath.Text);
-
-
         }
 
         private void btnLzip_Click(object sender, EventArgs e)

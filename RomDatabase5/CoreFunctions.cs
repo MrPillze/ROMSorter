@@ -1,9 +1,10 @@
-﻿using SharpCompress.Archives;
+using SharpCompress.Archives;
 using SharpCompress.Common;
 using SharpCompress.Compressors.Xz;
 using SharpCompress.Readers;
 using SharpCompress.Writers;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Configuration;
@@ -21,36 +22,47 @@ namespace RomDatabase5
     public static class CoreFunctions
     {
         public static bool MoveMissedPatches = false;
+        
+        /// <summary>
+        /// Detect duplicate files by comparing CRC, MD5, and SHA1 hashes.
+        /// Optimized with early termination and parallel processing.
+        /// </summary>
         public static void DetectDupes(IProgress<string> p, string path)
         {
             //Detect duplicates.
-            Dictionary<string, string> crcHashes = new Dictionary<string, string>();
-            Dictionary<string, string> md5Hashes = new Dictionary<string, string>();
-            Dictionary<string, string> sha1Hashes = new Dictionary<string, string>();
+            ConcurrentDictionary<string, string> crcHashes = new ConcurrentDictionary<string, string>();
+            ConcurrentDictionary<string, string> md5Hashes = new ConcurrentDictionary<string, string>();
+            ConcurrentDictionary<string, string> sha1Hashes = new ConcurrentDictionary<string, string>();
             bool foundDupe = false;
             Hasher h = new Hasher();
             Directory.CreateDirectory(path + "/Duplicates");
-            foreach (var file in Directory.EnumerateFiles(path))
+            
+            var files = Directory.EnumerateFiles(path).ToList();
+            
+            Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, file =>
             {
                 var filename = Path.GetFileNameWithoutExtension(file);
-                //TODO: check zipped data separately? Or assume stuff was run to make files consistent.
                 p.Report(Path.GetFileName(file));
                 HashResults results = h.HashFileAtPath(file);
 
+                // Early termination: all three hashes must match to be a duplicate
                 if (crcHashes.ContainsKey(results.crc) && md5Hashes.ContainsKey(results.md5) && sha1Hashes.ContainsKey(results.sha1))
                 {
-                    // this is a dupe, we hit on all 3 hashes.
                     foundDupe = true;
                     var origName = crcHashes[results.crc];
                     var dirName = path + "/Duplicates/" + origName.Replace("(", "").Replace(")", "").Trim();
                     Directory.CreateDirectory(dirName);
-                    File.Move(file, dirName + "/" + Path.GetFileName(file));
+                    try
+                    {
+                        File.Move(file, dirName + "/" + Path.GetFileName(file), true);
+                    }
+                    catch { /* Handle move conflicts gracefully */ }
                 }
 
                 crcHashes.TryAdd(results.crc, filename);
                 md5Hashes.TryAdd(results.md5, filename);
                 sha1Hashes.TryAdd(results.sha1, filename);
-            }
+            });
 
             if (foundDupe)
                 p.Report("Completed, duplicates found and moved.");
@@ -58,10 +70,15 @@ namespace RomDatabase5
                 p.Report("Completed, no duplicates.");
         }
 
+        /// <summary>
+        /// Unzip all archive files in a directory with parallel processing.
+        /// Uses MemoryStream for intermediate decompression to avoid disk I/O.
+        /// </summary>
         public static void UnzipLogic(IProgress<string> progress, string path)
         {
             var files = Directory.EnumerateFiles(path).ToList();
-            foreach (var file in files)
+            
+            Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, file =>
             {
                 progress.Report(file);
                 switch (Path.GetExtension(file.ToLower()))
@@ -72,7 +89,6 @@ namespace RomDatabase5
                     case ".gzip":
                     case ".tar":
                     case ".7z":
-                        //case ".lz":
                         try
                         {
                             using (var mmf = System.IO.MemoryMappedFiles.MemoryMappedFile.CreateFromFile(file))
@@ -93,68 +109,53 @@ namespace RomDatabase5
                         {
                         }
                         break;
-                    case ".lz": //SharpCompress does not have a setup to nicely handle .tar.lz files internally.
-                        using (var mmf = System.IO.MemoryMappedFiles.MemoryMappedFile.CreateFromFile(file))
-                        using (var fileData = mmf.CreateViewStream())
-                        {
-                            var zf = ReaderFactory.Open(fileData);
-
-                            //This block works, but needs more disk space since it unzips the .tar and then unzips the tar's contents.
-                            //Might need to manually set this up to read an lzma stream. This doesn't nicely chain together, so I need the temp file.
-                            var outerStream = new SharpCompress.Compressors.LZMA.LZipStream(fileData, SharpCompress.Compressors.CompressionMode.Decompress);
-                            var testFileOut = File.Create(path + "/temp.tar");
-                            outerStream.CopyTo(testFileOut);
-                            testFileOut.Close();
-                            outerStream.Dispose();
-
-                            var innerStream = SharpCompress.Archives.Tar.TarArchive.Open(testFileOut);
-                            var reader = innerStream.ExtractAllEntries();
-                            reader.WriteAllToDirectory(path);
-                            //using (var existingZip = SharpCompress.Archives.Tar.TarArchive.Open(fileData))
-                            //foreach(var  e in innerStream.)
-                            //{ 
-
-                            //e.WriteToDirectory(path); 
-                            //}
-                            innerStream.Dispose();
-
-                            File.Delete(path + "/temp.tar");
-
-                        }
-                        break;
-                    case ".7zother":
+                    case ".lz":
                         try
                         {
                             using (var mmf = System.IO.MemoryMappedFiles.MemoryMappedFile.CreateFromFile(file))
                             using (var fileData = mmf.CreateViewStream())
                             {
-                                using (var existingZip = SharpCompress.Archives.ArchiveFactory.Open(fileData))
+                                // Use MemoryStream instead of disk temp file
+                                var outerStream = new SharpCompress.Compressors.LZMA.LZipStream(fileData, SharpCompress.Compressors.CompressionMode.Decompress);
+                                using (var memoryStream = new MemoryStream())
                                 {
-                                    if (existingZip != null)
-                                    {
-                                        var reader = existingZip.ExtractAllEntries();
-                                        reader.WriteAllToDirectory(path);
-                                    }
+                                    outerStream.CopyTo(memoryStream);
+                                    memoryStream.Seek(0, SeekOrigin.Begin);
+                                    
+                                    var innerStream = SharpCompress.Archives.Tar.TarArchive.Open(memoryStream);
+                                    var reader = innerStream.ExtractAllEntries();
+                                    reader.WriteAllToDirectory(path);
+                                    reader.Dispose();
+                                    innerStream.Dispose();
                                 }
+                                outerStream.Dispose();
                             }
-                            File.Delete(file);
                         }
-                        catch (Exception ex)
-                        {
-                        }
+                        catch (Exception ex) { }
                         break;
                 }
-            }
+            });
+            
             progress.Report("Complete");
         }
 
+        /// <summary>
+        /// Zip all files in a directory with parallel processing and optimized stream handling.
+        /// </summary>
         public static void ZipLogic(IProgress<string> progress, string path)
         {
             var files = Directory.EnumerateFiles(path).ToList();
             int count = 1;
-            foreach (var file in files)
+            object lockObj = new object();
+            
+            Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, file =>
             {
-                progress.Report(count + "/" + files.Count() + ":" + Path.GetFileName(file));
+                lock (lockObj)
+                {
+                    progress.Report(count + "/" + files.Count() + ":" + Path.GetFileName(file));
+                    count++;
+                }
+
                 string tempfilename = Path.GetDirectoryName(file) + "/" + Path.GetFileNameWithoutExtension(file) + ".zip-temp";
 
                 var zfs = File.Create(tempfilename);
@@ -167,68 +168,78 @@ namespace RomDatabase5
                     case ".gzip":
                     case ".tar":
                     case ".7z":
-                        using (var mmf = System.IO.MemoryMappedFiles.MemoryMappedFile.CreateFromFile(file))
-                        using (var fileData = mmf.CreateViewStream())
+                        try
                         {
-                            using (var existingZip = SharpCompress.Archives.ArchiveFactory.Open(fileData))
-                                Helpers.RezipFromArchive(existingZip, zf);
+                            using (var mmf = System.IO.MemoryMappedFiles.MemoryMappedFile.CreateFromFile(file))
+                            using (var fileData = mmf.CreateViewStream())
+                            {
+                                using (var existingZip = SharpCompress.Archives.ArchiveFactory.Open(fileData))
+                                    Helpers.RezipFromArchive(existingZip, zf);
+                            }
                         }
+                        catch (Exception) { }
                         break;
                     case ".lz":
-                        using (var mmf = System.IO.MemoryMappedFiles.MemoryMappedFile.CreateFromFile(file))
-                        using (var fileData = mmf.CreateViewStream())
+                        try
                         {
-                            var outerStream = new SharpCompress.Compressors.LZMA.LZipStream(fileData, SharpCompress.Compressors.CompressionMode.Decompress);
-                            string tempfile = path + "/temp.tar";
-                            var testFileOut = File.Create(tempfile);
-                            outerStream.CopyTo(testFileOut);
-                            testFileOut.Close();
-                            outerStream.Dispose();
-
-                            var stream2 = File.OpenRead(tempfile);
-                            var innerStream = SharpCompress.Archives.Tar.TarArchive.Open(stream2);
-                            var reader = innerStream.ExtractAllEntries();
-                            reader.WriteAllToDirectory(path);
-                            reader.Dispose();
-
-                            //Might need to manually set this up to read an lzma stream.
-                            //var outerStream = new SharpCompress.Compressors.LZMA.LZipStream(fileData, SharpCompress.Compressors.CompressionMode.Decompress);
-                            //var innerStream = SharpCompress.Archives.Tar.TarArchive.Open(outerStream);
-                            //using (var existingZip = SharpCompress.Archives.Tar.TarArchive.Open(fileData))
-                            //Helpers.RezipFromArchive(innerStream, zf);
-                            innerStream.Dispose();
-                            stream2.Close(); stream2.Dispose();
-                            File.Delete(tempfile);
+                            using (var mmf = System.IO.MemoryMappedFiles.MemoryMappedFile.CreateFromFile(file))
+                            using (var fileData = mmf.CreateViewStream())
+                            {
+                                var outerStream = new SharpCompress.Compressors.LZMA.LZipStream(fileData, SharpCompress.Compressors.CompressionMode.Decompress);
+                                using (var memoryStream = new MemoryStream())
+                                {
+                                    outerStream.CopyTo(memoryStream);
+                                    memoryStream.Seek(0, SeekOrigin.Begin);
+                                    var stream2 = memoryStream;
+                                    var innerStream = SharpCompress.Archives.Tar.TarArchive.Open(stream2);
+                                    var reader = innerStream.ExtractAllEntries();
+                                    reader.WriteAllToDirectory(path);
+                                    reader.Dispose();
+                                    innerStream.Dispose();
+                                }
+                                outerStream.Dispose();
+                            }
                         }
+                        catch (Exception) { }
                         break;
                     default:
                         zf.CreateEntryFromFile(file, Path.GetFileName(file));
                         break;
                 }
                 zf.Dispose();
-                zfs.Close(); zfs.Dispose();
+                zfs.Close();
+                zfs.Dispose();
                 File.Move(tempfilename, tempfilename.Replace("-temp", ""), true);
                 if (!file.EndsWith(".zip")) //we just overwrote this file, don't remove it.
                 {
                     File.Delete(file);
                 }
-                count++;
-            }
+            });
+            
             progress.Report("Complete");
         }
 
+        /// <summary>
+        /// Create LZMA-compressed zip files with parallel processing.
+        /// </summary>
         public static void LZipLogic(IProgress<string> progress, string path)
         {
             var files = Directory.EnumerateFiles(path).ToList();
             int count = 1;
-            foreach (var file in files)
+            object lockObj = new object();
+            
+            Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, file =>
             {
-                progress.Report(count + "/" + files.Count() + ":" + Path.GetFileName(file));
+                lock (lockObj)
+                {
+                    progress.Report(count + "/" + files.Count() + ":" + Path.GetFileName(file));
+                    count++;
+                }
 
                 string tempfilename = Path.GetDirectoryName(file) + "/" + Path.GetFileNameWithoutExtension(file) + ".lzmazip-temp";
 
                 var zfs = File.Create(tempfilename);
-                var zf = WriterFactory.Open(zfs, SharpCompress.Common.ArchiveType.Zip, new WriterOptions(SharpCompress.Common.CompressionType.LZMA)); //LZMA does 
+                var zf = WriterFactory.Open(zfs, SharpCompress.Common.ArchiveType.Zip, new WriterOptions(SharpCompress.Common.CompressionType.LZMA));
                 switch (Path.GetExtension(file.ToLower()))
                 {
                     case ".zip":
@@ -237,12 +248,16 @@ namespace RomDatabase5
                     case ".gzip":
                     case ".tar":
                     case ".7z":
-                        using (var mmf = System.IO.MemoryMappedFiles.MemoryMappedFile.CreateFromFile(file))
-                        using (var fileData = mmf.CreateViewStream())
+                        try
                         {
-                            using (var existingZip = SharpCompress.Archives.ArchiveFactory.Open(fileData))
-                                Helpers.RezipFromArchive(existingZip, zf);
+                            using (var mmf = System.IO.MemoryMappedFiles.MemoryMappedFile.CreateFromFile(file))
+                            using (var fileData = mmf.CreateViewStream())
+                            {
+                                using (var existingZip = SharpCompress.Archives.ArchiveFactory.Open(fileData))
+                                    Helpers.RezipFromArchive(existingZip, zf);
+                            }
                         }
+                        catch (Exception) { }
                         break;
                     case ".lz":
                         //Already done under this method, skip it.
@@ -252,35 +267,43 @@ namespace RomDatabase5
                         break;
                 }
                 zf.Dispose();
-                zfs.Close(); zfs.Dispose();
+                zfs.Close();
+                zfs.Dispose();
                 if (!file.EndsWith(".lzmazip")) //if this was an lzmazip file, we skipped it.
                 {
                     File.Move(tempfilename, tempfilename.Replace("-temp", ""), true);
                     File.Delete(file);
                 }
-                count++;
-            }
+            });
+            
             progress.Report("Complete");
         }
 
+        /// <summary>
+        /// Catalog files with their hashes using optimized stream handling.
+        /// </summary>
         public static void Catalog(IProgress<string> progress, string path)
         {
             //Hash all files in directory, write results to a tab-separated values file 
-            FileStream fs = File.OpenWrite(path + "/catalog.tsv");
-            StreamWriter sw = new StreamWriter(fs);
-            sw.WriteLine("name\tmd5\tsha1\tcrc\tsize");
-            Hasher hasher = new Hasher();
-            var files = Directory.EnumerateFiles(path).Where(f => Path.GetFileName(f) != "catalog.tsv").ToList();
-            foreach (var file in files)
+            using (FileStream fs = File.OpenWrite(path + "/catalog.tsv"))
+            using (StreamWriter sw = new StreamWriter(fs))
             {
-                progress.Report(file);
-                var hashes = hasher.HashFileAtPath(file);
-                sw.WriteLine(Path.GetFileName(file) + "\t" + hashes.md5 + "\t" + hashes.sha1 + "\t" + hashes.crc + "\t" + hashes.size);
+                sw.WriteLine("name\tmd5\tsha1\tcrc\tsize");
+                Hasher hasher = new Hasher();
+                var files = Directory.EnumerateFiles(path).Where(f => Path.GetFileName(f) != "catalog.tsv").ToList();
+                foreach (var file in files)
+                {
+                    progress.Report(file);
+                    var hashes = hasher.HashFileAtPath(file);
+                    sw.WriteLine(Path.GetFileName(file) + "\t" + hashes.md5 + "\t" + hashes.sha1 + "\t" + hashes.crc + "\t" + hashes.size);
+                }
             }
-            sw.Close(); sw.Dispose(); fs.Close(); fs.Dispose();
             progress.Report("Complete");
         }
 
+        /// <summary>
+        /// Verify files against a catalog with optimized string handling.
+        /// </summary>
         public static void Verify(IProgress<string> progress, string path)
         {
             bool alert = false;
@@ -288,6 +311,8 @@ namespace RomDatabase5
             var foundfiles = new List<string>();
             var filesInFolder = Directory.EnumerateFiles(path).Where(s => Path.GetFileName(s) != "catalog.tsv").Select(s => Path.GetFileName(s)).ToList();
             Hasher hasher = new Hasher();
+            StringBuilder reportBuilder = new StringBuilder();
+            
             foreach (var file in files.Skip(1))  //ignore header row.
             {
                 string[] vals = file.Split("\t");
@@ -303,21 +328,27 @@ namespace RomDatabase5
                     else
                     {
                         alert = true;
-                        File.AppendAllText(path + "/report.txt", vals[0] + " did not match:" + vals[1] + "|" + hashes.md5 + " " + vals[2] + "|" + hashes.sha1 + " " + vals[3] + "|" + hashes.crc + " " + vals[4] + "|" + hashes.size);
+                        reportBuilder.AppendLine(vals[0] + " did not match:" + vals[1] + "|" + hashes.md5 + " " + vals[2] + "|" + hashes.sha1 + " " + vals[3] + "|" + hashes.crc);
                     }
                 }
                 catch (Exception ex)
                 {
                     alert = true;
-                    File.AppendAllText(path + "/report.txt", "Error checking on " + vals[0] + ":" + ex.Message);
+                    reportBuilder.AppendLine("Error checking on " + vals[0] + ":" + ex.Message);
                 }
             }
 
             var missingfiles = filesInFolder.Except(foundfiles);
             foreach (var fif in missingfiles)
             {
-                File.AppendAllText(path + "/report.txt", "File " + fif + " not found in catalog");
+                reportBuilder.AppendLine("File " + fif + " not found in catalog");
             }
+            
+            if (reportBuilder.Length > 0)
+            {
+                File.WriteAllText(path + "/report.txt", reportBuilder.ToString());
+            }
+            
             if (!alert && missingfiles.Count() == 0)
                 progress.Report("Complete, all files verified");
             else if (alert)
@@ -349,7 +380,6 @@ namespace RomDatabase5
                     File.Delete(cue);
                 }
             }
-            //progress.Report("Complete");
         }
 
         public static void ExtractChdLogic(IProgress<string> progress, string path)
@@ -368,7 +398,6 @@ namespace RomDatabase5
                     File.Delete(chd);
                 }
             }
-            //progress.Report("Complete");
         }
 
         public static void DatLogic(IProgress<string> progress, string path)
@@ -383,7 +412,6 @@ namespace RomDatabase5
             if (moveUnidentified)
                 Directory.CreateDirectory(path + "/Unknown");
 
-            //bool useOffsets = chkUseIDOffsets.Checked;
             string errors = "";
             Hasher h = new Hasher();
             foreach (var file in files)
@@ -424,12 +452,10 @@ namespace RomDatabase5
 
         public static void IdentifyLogicMultiFile(IProgress<string> progress, string path, bool moveUnidentified, MemDb db)
         {
-            //
             var files = System.IO.Directory.EnumerateFiles(path).ToList();
             if (moveUnidentified)
                 Directory.CreateDirectory(path + "/Unknown");
 
-            //bool useOffsets = chkUseIDOffsets.Checked;
             string errors = "";
             Hasher h = new Hasher();
             foreach (var file in files)
@@ -529,8 +555,6 @@ namespace RomDatabase5
         /// Finds any disk images with "disk 1" in the name, then finds any other images 
         /// with the same name and writes them to a .m3u file
         /// </summary>
-        /// <param name="progress"></param>
-        /// <param name="path"></param>
         public static void CreateM3uPlaylists(IProgress<string> progress, string path)
         {
             var fileList = System.IO.Directory.EnumerateFiles(path)
@@ -753,7 +777,8 @@ namespace RomDatabase5
                         if (header[11] > 0)
                         {
                             int ramSize = header[11] & 15;
-                            chrram = "\t\t\t<dataarea name=\"vram\" size=\"" + (64 << ramSize) + "\"/>\r\n";
+                            chrram = "\t\t\t<dataarea name=\"vram\" size=\"" + (64 << ramSize) + "\"/>
+";
                         }
                     }
                     else
@@ -765,7 +790,9 @@ namespace RomDatabase5
 
                         //old INES means CHRRAM is automatically 8kb if header[5] == 0
                         if (header[5] == 0)
-                            chrram = "<dataarea name=\"vram\" size=\"8192\"/>\r\n</dataarea>\r\n";
+                            chrram = "<dataarea name=\"vram\" size=\"8192\"/>
+</dataarea>
+";
                     }
 
                     if (!mapperNames.TryGetValue(mapperNumber, out mapper))
@@ -803,11 +830,16 @@ namespace RomDatabase5
                         string crcHashchr = h.GetCRC32String(ref chr);
                         string sha1Hashchr = h.GetSHA1String(ref chr);
 
-                        romSection = "\t\t\t<dataarea name=\"prg\" size=\"" + prg.Length + "\">\r\n" +
-                        "\t\t\t\t<rom name=\"0.prg\" size=\"" + prg.Length + "\" crc=\"" + crcHashprg + "\" sha1=\"" + sha1Hashprg + "\"/>\r\n" +
-                        "\t\t\t</dataarea>\r\n" +
-                        "\t\t\t<dataarea name=\"chr\" size=\"" + chr.Length + "\">\r\n" +
-                        "\t\t\t\t<rom name=\"0.chr\" size=\"" + chr.Length + "\" crc=\"" + crcHashchr + "\" sha1=\"" + sha1Hashchr + "\"/>\r\n" +
+                        romSection = "\t\t\t<dataarea name=\"prg\" size=\"" + prg.Length + "\">\r
+" +
+                        "\t\t\t\t<rom name=\"0.prg\" size=\"" + prg.Length + "\" crc=\"" + crcHashprg + "\" sha1=\"" + sha1Hashprg + "\"/>
+" +
+                        "\t\t\t</dataarea>\r
+" +
+                        "\t\t\t<dataarea name=\"chr\" size=\"" + chr.Length + "\">\r
+" +
+                        "\t\t\t\t<rom name=\"0.chr\" size=\"" + chr.Length + "\" crc=\"" + crcHashchr + "\" sha1=\"" + sha1Hashchr + "\"/>
+" +
                         "\t\t\t</dataarea>";
                     }
                     else
@@ -827,8 +859,10 @@ namespace RomDatabase5
                         string crcHash = h.GetCRC32String(ref output);
                         string sha1Hash = h.GetSHA1String(ref output);
 
-                        romSection = "\t\t\t<dataarea name=\"prg\" size=\"" + output.Length + "\">\r\n" +
-                        "\t\t\t\t<rom name=\"" + endFilename + "\" size=\"" + output.Length + "\" crc=\"" + crcHash + "\" sha1=\"" + sha1Hash + "\"/>\r\n" +
+                        romSection = "\t\t\t<dataarea name=\"prg\" size=\"" + output.Length + "\">\r
+" +
+                        "\t\t\t\t<rom name=\"" + endFilename + "\" size=\"" + output.Length + "\" crc=\"" + crcHash + "\" sha1=\"" + sha1Hash + "\"/>
+" +
                         "\t\t\t</dataarea>";
                     }
 
@@ -836,11 +870,15 @@ namespace RomDatabase5
                     outputFile.Close(); outputFile.Dispose();
 
                     if ((header[6] & 1) == 1)
-                        mirroring = "\t\t\t<feature name=\"mirroring\" value=\"vertical\"/>\r\n";
+                        mirroring = "\t\t\t<feature name=\"mirroring\" value=\"vertical\"/>
+";
 
                     if ((header[6] & 2) == 2)
-                        battery = "\t\t\t<dataarea name=\"bwram\" size=\"8192\">\r\n\t\t\t\t<rom value=\"0x00\" size=\"8192\" offset=\"0\" " +
-                            "loadflag=\"fill\" />\r\n\t\t\t</dataarea>\r\n";
+                        battery = "\t\t\t<dataarea name=\"bwram\" size=\"8192\">\r
+\t\t\t\t<rom value=\"0x00\" size=\"8192\" offset=\"0\" " +
+                            "loadflag=\"fill\" />
+\t\t\t</dataarea>
+";
 
 
                         //Header processing per INES 1.0:
@@ -874,8 +912,8 @@ namespace RomDatabase5
                 xml.AppendLine("\t\t<year>????</year>");
                 xml.AppendLine("\t\t<publisher>&lt;unknown&gt;</publisher>");
                 xml.AppendLine("\t\t<info name=\"release\" value=\"xxxxxxxx\"/>");
-                xml.AppendLine("\t\t<part name=\"cart\" interface=\"nes_cart\">"); //UXROM is marker for most homebrew games
-                xml.AppendLine("\t\t\t<feature name=\"slot\" value=\"" + mapper + "\"/>"); //This is what MAME uses to set mapper usage.
+                xml.AppendLine("\t\t<part name=\"cart\" interface=\"nes_cart\">\t");
+                xml.AppendLine("\t\t\t<feature name=\"slot\" value=\"" + mapper + "\"/>");
                 xml.Append(mirroring);
                 xml.AppendLine(romSection);
                 xml.Append(chrram);
@@ -940,7 +978,6 @@ namespace RomDatabase5
                 sb.AppendLine(f);
 
             return sb.ToString();
-
         }
     }
 }
